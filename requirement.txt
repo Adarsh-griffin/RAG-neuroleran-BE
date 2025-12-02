@@ -19,3 +19,4 @@ huggingface_hub
 
 python-dotenv
 boto3
+gunicorn
