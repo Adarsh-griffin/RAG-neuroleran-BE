@@ -1,5 +1,5 @@
 from langchain_qdrant.vectorstores import Qdrant
-from langchain.embeddings import HuggingFaceBgeEmbeddings
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from qdrant_client import QdrantClient
 import os
 
