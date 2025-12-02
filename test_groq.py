@@ -10,37 +10,113 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from pymongo import MongoClient
+import gridfs
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from retrieval import get_relevant_docs
+from groq import Groq, GroqError
+from pathlib import Path
 # from faster_whisper import WhisperModel  # Local STT disabled; using Groq hosted Whisper
+from dotenv import load_dotenv, find_dotenv
+from lipsync import generate_lipsync_video, upload_audio_to_s3
+TTS_OUTPUT_FOLDER = "path/to/your/static/collections"
+
+
+# Attempt to locate and load a .env file. This will search parent directories so a
+# single .env at the repo root (one level above `NeuroBack`) will be found when
+# running scripts from the `NeuroBack` folder.
+env_path = find_dotenv()
+if env_path:
+    load_dotenv(env_path)
+else:
+    # Fallback: try parent directory relative to this file
+    parent_env = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    if os.path.exists(parent_env):
+        load_dotenv(parent_env)
+        env_path = parent_env
+
+if env_path:
+    print(f"Loaded environment from: {env_path}")
+else:
+    print("No .env file found by find_dotenv(); relying on OS environment variables.")
 
 # ---------------- Groq Setup ----------------
 from groq import Groq
 
 # Initialize Groq clients (supports multiple API keys for rotation)
 # Load API keys from environment variables
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY environment variable is required")
+GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
+if not GROQ_API_KEYS_STR:
+    raise ValueError(
+        "GROQ_API_KEY environment variable is required.\n"
+        "Make sure you have added GROQ_API_KEY to your OS environment or to a .env file.\n"
+        "If you keep a .env at the repo root, run this script from the repo root or ensure the .env is discovered (we searched parent folders)."
+    )
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
+if not GROQ_API_KEYS:
+     raise ValueError("No valid GROQ_API_KEYs found after splitting by comma.")
+
+print(f"Loaded {len(GROQ_API_KEYS)} Groq API keys.")
+
+_current_key_index = 0
+
+def get_current_groq_client():
+    global _current_key_index
+    return Groq(api_key=GROQ_API_KEYS[_current_key_index])
+
+def rotate_key():
+    global _current_key_index
+    _current_key_index = (_current_key_index + 1) % len(GROQ_API_KEYS)
+    print(f"Rotating to Groq API key index: {_current_key_index}")
+
+def execute_with_retry(func, *args, **kwargs):
+    """
+    Execute a function that uses the Groq client.
+    If it fails with a rate limit or auth error, rotate the key and retry.
+    """
+    max_retries = len(GROQ_API_KEYS)
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            client = get_current_groq_client()
+            # Pass the client to the function if it expects it, 
+            # or rely on the function using the global client if we were using one.
+            # However, since we are rotating, we should pass the client explicitly or 
+            # have the function ask for a client.
+            # A better pattern here is to pass the client to the callback.
+            return func(client, *args, **kwargs)
+        except Exception as e:
+            # Check for specific Groq errors if possible, e.g. 429 or 401
+            # For now, we catch generic Exception but you might want to be more specific
+            print(f"Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
+            last_exception = e
+            rotate_key()
+    
+    raise last_exception
+
+groq_client = get_current_groq_client() # Initial client for backward compatibility if needed
 
 def groq_generate(prompt, max_tokens=512, temperature=0.7):
     """Send a prompt to Groq and return the response text."""
-    try:
-        completion = groq_client.chat.completions.create(
+    
+    def _do_generate(client, p, mt, temp):
+        completion = client.chat.completions.create(
             model="openai/gpt-oss-20b",  # You can change to other Groq models if needed
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_completion_tokens=max_tokens,
+            messages=[{"role": "user", "content": p}],
+            temperature=temp,
+            max_completion_tokens=mt,
             top_p=1,
             reasoning_effort="low",
             stream=False  # non-streaming for API responses
         )
         return completion.choices[0].message.content.strip()
+
+    try:
+        return execute_with_retry(_do_generate, prompt, max_tokens, temperature)
     except Exception as e:
-        print(f"Error generating response: {e}")
+        print(f"Error generating response after retries: {e}")
         return None
 
 llm = groq_generate
@@ -76,20 +152,54 @@ if not os.path.exists(TTS_OUTPUT_FOLDER):
     os.makedirs(TTS_OUTPUT_FOLDER)
 
 # ---------------- fal.ai Kokoro TTS Config (manual overrides) ----------------
-# You can hardcode your fal.ai API key and endpoint here. If left blank, the app
-# will fall back to environment variables FAL_API_KEY/FAL_KEY and FAL_KOKORO_URL.
-FAL_API_KEY = "11984d35-b73b-4797-9697-d4e91775aff7:e705f60c28ccf229d7235ff0b6f860c0"  # Format: <id>:<secret> used with 'Key ' header on fal.run
-FAL_KOKORO_URL = "https://api.fal.ai/kokoro/tts"  # Change if your endpoint differs
+# You can set your fal.ai API key and endpoint in the .env file or environment.
+# The app will fall back to environment variables FAL_API_KEY/FAL_KEY and FAL_KOKORO_URL.
+FAL_API_KEY = os.getenv("FAL_API_KEY")
+FAL_KOKORO_URL = os.getenv("FAL_KOKORO_URL", "https://api.fal.ai/kokoro/tts")
 
 try:
     client = MongoClient('mongodb://localhost:27017/')
     db = client['neurolearn']
     files_collection = db['files']
+    fs = gridfs.GridFS(db, collection="tts_audio")
     client.server_info()
     print("✅ MongoDB connection successful.")
 except Exception as e:
     print(f"❌ Could not connect to MongoDB: {e}")
     client = None
+    fs = None
+
+# ---------------- Collection helpers ----------------
+def resolve_file_context(file_name_req: str | None = None):
+    """Return (file_doc, safe_folder_name) for downstream storage."""
+    file_doc = None
+    try:
+        if file_name_req:
+            file_doc = files_collection.find_one({"originalName": file_name_req})
+        if not file_doc:
+            file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+    except Exception:
+        file_doc = None
+
+    folder_candidate = None
+    if file_doc:
+        folder_candidate = file_doc.get("folder") or file_doc.get("originalName")
+    if not folder_candidate:
+        folder_candidate = file_name_req or f"default-{int(datetime.utcnow().timestamp())}"
+    safe_folder = secure_filename(os.path.splitext(folder_candidate)[0]) or "default"
+    return file_doc, safe_folder
+
+
+def build_collection_url(relative_path: str) -> str:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    return f"/collections/{normalized}"
+
+
+def serialize_datetime(value):
+    if isinstance(value, datetime):
+        return value.isoformat() + ("Z" if value.tzinfo is None else "")
+    return value
+
 
 # ---------------- Helper ----------------
 def extract_helpful_answer(text):
@@ -332,110 +442,276 @@ def get_links():
 
 @app.route('/api/learning-tts', methods=['POST'])
 def learning_tts():
-    """Synthesize speech for given text using fal.ai Kokoro and return a public audio URL."""
+    """Synthesize speech for given text using Groq/PlayAI and store audio in MongoDB GridFS."""
     try:
         data = request.get_json(force=True)
         text = (data or {}).get('text', '').strip()
-        voice = (data or {}).get('voice', 'af_heart')  # example voice
-        speed = float((data or {}).get('speed', 1.0))
+        voice = (data or {}).get('voice', 'Aaliyah-PlayAI')
+        model = (data or {}).get('model', 'playai-tts')
+        file_name_req = (data or {}).get('fileName') or (data or {}).get('file_name')
+        print(f"[PLAYAI-TTS] Incoming request: fileName={file_name_req}, text_len={len(text)}")
+        
+        # Get file document early so we can reuse it
+        file_doc = None
+        try:
+            if file_name_req:
+                file_doc = files_collection.find_one({"originalName": file_name_req})
+            if not file_doc:
+                file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+            if file_doc:
+                print(f"[PLAYAI-TTS] Using file_doc originalName={file_doc.get('originalName')}")
+        except Exception:
+            file_doc = None
+            print("[PLAYAI-TTS] Warning: unable to fetch file_doc; proceeding without DB context.")
+
+        timestamp = int(datetime.utcnow().timestamp())
+        folder_seed_value = None
+        if file_doc and file_doc.get('originalName'):
+            folder_seed_value = file_doc['originalName']
+        elif file_name_req:
+            folder_seed_value = file_name_req
+        else:
+            folder_seed_value = f"unnamed-{timestamp}"
+        folder_basename = os.path.splitext(folder_seed_value)[0]
+        safe_folder = secure_filename(folder_basename) or "default"
 
         if not text:
-            # Fallback to latest script text if none provided
-            file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
-            if not file_doc or "explanation" not in file_doc:
-                return jsonify({"error": "No text provided and no content available."}), 400
-            text = " ".join(item.get("explanation", "") for item in file_doc["explanation"]).strip()
-
-        fal_key = (FAL_API_KEY or os.getenv('FAL_API_KEY') or os.getenv('FAL_KEY'))
-        if not fal_key:
-            return jsonify({"error": "FAL_API_KEY not set in environment."}), 500
-
-        # NOTE: Endpoint may vary; try multiple endpoints/headers for resilience
-        candidates = [
-            # Preferred working format (matches your Postman screenshot):
-            #   URL: https://fal.run/fal-ai/kokoro/american-english
-            #   Header: Authorization: Key <fal_id:secret>
-            ('https://fal.run/fal-ai/kokoro/american-english', 'Key'),
-            # Fallbacks
-            (FAL_KOKORO_URL or os.getenv('FAL_KOKORO_URL', 'https://api.fal.ai/kokoro/tts'), 'Key'),
-            ('https://fal.run/fal-ai/kokoro/tts', 'Key'),
-            ('https://api.fal.ai/v1/kokoro/tts', 'Key'),
-            ('https://api.fal.ai/kokoro/tts', 'Bearer'),
-            ('https://fal.run/fal-ai/kokoro/tts', 'Bearer'),
-        ]
-
-        payload = {
-            "input": {
-                "text": text,
-                "voice": voice,
-                "speed": speed,
-                # add other kokoro params as needed
-            }
-        }
-        last_error = None
-        resp = None
-        for fal_url, auth_mode in candidates:
             try:
-                if not fal_url:
-                    continue
-                headers = {
-                    "Authorization": (f"Key {fal_key}" if auth_mode == 'Key' else f"Bearer {fal_key}"),
-                    "Content-Type": "application/json"
-                }
-                print(f"[KOKORO-TTS] Trying {fal_url} with {auth_mode} auth…")
-                resp = requests.post(fal_url, headers=headers, data=json.dumps(payload), timeout=60)
-                if resp.status_code < 300:
-                    break
-                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
-            except requests.exceptions.RequestException as e:
-                last_error = str(e)
-                continue
-
-        if not resp or resp.status_code >= 300:
-            return jsonify({"error": "fal.ai TTS request failed", "details": last_error}), 502
-
-        print(f"[KOKORO-TTS] fal.ai response status: {resp.status_code}")
-        print(f"[KOKORO-TTS] Response headers: {dict(resp.headers)}")
-
-        # Expecting binary audio or a URL. Handle both cases.
-        audio_bytes = None
-        audio_url_from_fal = None
-        try:
-            # If fal returns JSON with a URL
-            j = resp.json()
-            print(f"[KOKORO-TTS] fal.ai JSON response: {j}")
-            audio_url_from_fal = j.get('audio_url') or j.get('output', {}).get('audio_url')
-        except Exception:
-            print(f"[KOKORO-TTS] No JSON response, treating as binary audio (size: {len(resp.content)} bytes)")
-            pass
-
-        if not audio_url_from_fal:
-            # Assume binary audio stream
-            audio_bytes = resp.content
-
-        # Save locally if we have bytes; otherwise proxy the remote URL
-        public_url = None
-        if audio_bytes:
-            out_name = f"learning-tts-{int(datetime.utcnow().timestamp())}.mp3"
-            out_path = os.path.join(TTS_OUTPUT_FOLDER, out_name)
-            with open(out_path, 'wb') as f:
-                f.write(audio_bytes)
-            public_url = f"/static/collections/{out_name}"
-            print(f"[KOKORO-TTS] Saved audio locally: {out_path}")
-            print(f"[KOKORO-TTS] Public URL: {public_url}")
+                if not file_doc or "explanation" not in file_doc:
+                    return jsonify({"error": "No text provided and no content available."}), 400
+                
+                # Handle different explanation formats
+                exp = file_doc.get("explanation")
+                if isinstance(exp, list):
+                    text = " ".join(item.get("explanation", "") if isinstance(item, dict) else str(item) for item in exp).strip()
+                elif isinstance(exp, dict):
+                    text = str(exp.get("explanation", "")).strip()
+                else:
+                    text = str(exp).strip() if exp else ""
+                
+                if not text:
+                    return jsonify({"error": "No text found in explanation."}), 400
+                    
+                print(f"[PLAYAI-TTS] Fetched summary text from DB (length: {len(text)} chars)")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return jsonify({"error": f"No text provided and database is inaccessible: {str(e)}"}), 400
         else:
-            public_url = audio_url_from_fal
-            print(f"[KOKORO-TTS] Using remote URL from fal.ai: {public_url}")
+            print(f"[PLAYAI-TTS] Using provided text length={len(text)}")
 
-        if not public_url:
-            return jsonify({"error": "No audio produced by fal.ai"}), 502
+        def _do_tts(client, m, v, txt):
+            return client.audio.speech.create(
+                model=m,
+                voice=v,
+                response_format="wav",
+                input=txt,
+            )
 
-        print(f"[KOKORO-TTS] Final audio URL returned: {public_url}")
-        return jsonify({"audioUrl": public_url})
+        try:
+            print(f"[PLAYAI-TTS] Synthesizing for model: {model}, voice: {voice}, format: wav, text_len={len(text)}")
+            response = execute_with_retry(_do_tts, model, voice, text)
+        except Exception as e:
+            return jsonify({"error": "Groq/PlayAI TTS request failed after retries", "details": str(e)}), 502
+
+        # Robustly obtain audio bytes from response. The Groq client may expose
+        # different interfaces depending on version: prefer iter_bytes(), then
+        # try .content, then fall back to streaming to a temp file.
+        audio_bytes = b""
+        try:
+            if hasattr(response, 'iter_bytes'):
+                print('[PLAYAI-TTS] Using response.iter_bytes() to collect audio bytes')
+                for chunk in response.iter_bytes():
+                    audio_bytes += chunk
+            elif hasattr(response, 'content'):
+                print('[PLAYAI-TTS] Using response.content to collect audio bytes')
+                audio_bytes = response.content or b''
+            else:
+                # Fallback: try to stream to a temp file using provided helper
+                tmp_path = Path(TTS_OUTPUT_FOLDER) / f"tmp-tts-{int(datetime.utcnow().timestamp())}.wav"
+                try:
+                    if hasattr(response, 'stream_to_file'):
+                        print(f'[PLAYAI-TTS] Falling back to response.stream_to_file -> {tmp_path}')
+                        response.stream_to_file(tmp_path)
+                        with open(tmp_path, 'rb') as f:
+                            audio_bytes = f.read()
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    else:
+                        print('[PLAYAI-TTS] Response has no known byte access methods')
+                except Exception as e:
+                    print(f'[PLAYAI-TTS] fallback stream_to_file failed: {e}')
+        except Exception as e:
+            print(f'[PLAYAI-TTS] Error while extracting bytes from response: {e}')
+
+        print(f"[PLAYAI-TTS] Retrieved audio bytes length: {len(audio_bytes) if audio_bytes is not None else 'None'}")
+
+        # Validate audio content
+        if not audio_bytes:
+            # Provide as much debug info as possible
+            debug_info = None
+            try:
+                # Some response objects provide a .status_code or .text
+                debug_info = {
+                    'has_iter_bytes': hasattr(response, 'iter_bytes'),
+                    'has_content': hasattr(response, 'content'),
+                    'repr': repr(response)[:1000]
+                }
+            except Exception:
+                debug_info = repr(response)[:1000]
+            print(f"[PLAYAI-TTS] ERROR: No audio bytes were retrieved from the TTS response. Debug: {debug_info}")
+            return jsonify({"error": "TTS generation returned no audio bytes", "debug": debug_info}), 502
+
+        # Store in MongoDB GridFS
+        if fs is None:
+            return jsonify({"error": "MongoDB GridFS is not available."}), 500
+        meta = {
+            "created_at": datetime.utcnow(),
+            "voice": voice,
+            "model": model,
+            "text": text,
+        }
+        filename_label = safe_folder or "default"
+        filename = f"learning-tts-{filename_label}-{timestamp}.wav"
+        gridfs_id = fs.put(audio_bytes, filename=filename, contentType="audio/wav", metadata=meta)
+        print(f"[PLAYAI-TTS] Saved audio to MongoDB GridFS with id: {gridfs_id}, filename: {filename}")
+
+        # Associate with a file document in `files` collection (already fetched above)
+
+        audio_meta = {
+            "type": "summary",
+            "gridfs_id": gridfs_id,
+            "filename": filename,
+            "contentType": "audio/wav",
+            "created_at": datetime.utcnow(),
+            "voice": voice,
+            "model": model,
+        }
+
+        # Ensure a per-PDF folder exists in the public TTS output folder and save files locally
+        try:
+            local_folder = os.path.join(TTS_OUTPUT_FOLDER, safe_folder)
+            os.makedirs(local_folder, exist_ok=True)
+
+            # save summary text locally
+            try:
+                summary_path = os.path.join(local_folder, 'summary.txt')
+                with open(summary_path, 'w', encoding='utf-8') as sf:
+                    sf.write(text)
+                print(f"[PLAYAI-TTS] Wrote summary.txt to {summary_path}")
+            except Exception as e:
+                print(f"[PLAYAI-TTS] Warning: failed to write summary.txt locally: {e}")
+
+            # save audio locally
+            local_audio_name = audio_meta['filename']
+            local_audio_path = os.path.join(local_folder, local_audio_name)
+            try:
+                with open(local_audio_path, 'wb') as af:
+                    af.write(audio_bytes)
+                print(f"[PLAYAI-TTS] Wrote audio file locally to {local_audio_path}")
+            except Exception as e:
+                print(f"[PLAYAI-TTS] Warning: failed to write audio file locally: {e}")
+        except Exception as e:
+            print(f"[PLAYAI-TTS] Warning: failed to associate or save local files for audio: {e}")
+            local_audio_name = audio_meta['filename']
+
+        # Upload audio to S3 so lipsync can fetch the latest file
+        try:
+            s3_upload = upload_audio_to_s3(audio_bytes, local_audio_name, folder=safe_folder)
+            audio_meta["s3_key"] = s3_upload["key"]
+            audio_meta["s3_url"] = s3_upload["url"]
+            print(f"[PLAYAI-TTS] Uploaded audio to S3: key={s3_upload['key']} url={s3_upload['url']}")
+        except Exception as e:
+            print(f"[PLAYAI-TTS] Error uploading audio to S3: {e}")
+            return jsonify({"error": f"Failed to upload audio to S3: {e}"}), 500
+
+        try:
+            if file_doc:
+                files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"summary": text, "folder": safe_folder}})
+                files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"audios": audio_meta}})
+            else:
+                new_doc = {
+                    "originalName": file_name_req or folder_seed_value or f"unnamed-{timestamp}",
+                    "uploadDate": datetime.utcnow(),
+                    "summary": text,
+                    "folder": safe_folder,
+                    "audios": [audio_meta]
+                }
+                files_collection.insert_one(new_doc)
+        except Exception as e:
+            print(f"[PLAYAI-TTS] Warning: failed to write audio metadata to MongoDB: {e}")
+
+        video_payload = None
+        try:
+            print(f"[PLAYAI-TTS] Triggering auto lipsync generation for folder='{safe_folder}'")
+            lipsync_result = generate_lipsync_video(target_folder=safe_folder)
+            s3_video = lipsync_result.get("s3_video")
+            video_url = s3_video["url"] if s3_video else build_collection_url(lipsync_result["relative_path"])
+            video_payload = {
+                "video_url": video_url,
+                "video_filename": lipsync_result.get("video_filename"),
+                "audio_key": (lipsync_result.get("audio") or {}).get("key"),
+                "audio_url": (lipsync_result.get("audio") or {}).get("url"),
+            }
+            print(f"[PLAYAI-TTS] Auto lipsync completed: {video_payload}")
+            
+            # Save video metadata to MongoDB
+            try:
+                if file_doc:
+                    # Enrich payload with timestamp for sorting
+                    video_meta = video_payload.copy()
+                    video_meta["created_at"] = datetime.utcnow()
+                    video_meta["relative_path"] = lipsync_result.get("relative_path")
+                    
+                    files_collection.update_one(
+                        {"_id": file_doc["_id"]}, 
+                        {"$push": {"videos": video_meta}}
+                    )
+                    print(f"[PLAYAI-TTS] Saved video metadata to MongoDB for {safe_folder}")
+            except Exception as e:
+                print(f"[PLAYAI-TTS] Warning: failed to save video metadata to MongoDB: {e}")
+
+        except Exception as e:
+            print(f"[PLAYAI-TTS] Warning: auto lipsync generation failed: {e}")
+            video_payload = {"error": str(e)}
+
+        # Return both audioId and audio_url for frontend compatibility
+        audio_url = f"/api/tts-audio/{gridfs_id}"
+        result = {
+            "audioId": str(gridfs_id),
+            "audio_url": audio_url
+        }
+        if audio_meta.get("s3_url"):
+            result["s3_url"] = audio_meta["s3_url"]
+        if 'local_audio_name' in locals() and 'safe_folder' in locals():
+            result["local_path"] = os.path.join(safe_folder, local_audio_name)
+        if video_payload:
+            result["video"] = video_payload
+        print(f"[PLAYAI-TTS] Returning response: {result}")
+        return jsonify(result)
+
+    except GroqError as e:
+        print(f"[PLAYAI-TTS] Groq API Error: {e}")
+        return jsonify({"error": "Groq/PlayAI TTS request failed", "details": str(e)}), 502
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+# Endpoint to retrieve TTS audio from MongoDB GridFS by id
+@app.route('/api/tts-audio/<audio_id>', methods=['GET'])
+def get_tts_audio(audio_id):
+    """Stream TTS audio from MongoDB GridFS by id."""
+    try:
+        from bson import ObjectId
+        if fs is None:
+            return jsonify({"error": "MongoDB GridFS is not available."}), 500
+        gridout = fs.get(ObjectId(audio_id))
+        return Response(gridout.read(), mimetype=gridout.content_type,
+                        headers={"Content-Disposition": f"attachment; filename={gridout.filename}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 404
 
 # ==================================================================================================================================
 # --- Q&A TTS via Groq Play.ai ---
@@ -455,20 +731,99 @@ def qa_tts():
         target_name = f"qa-tts-{int(datetime.utcnow().timestamp())}.{fmt}"
         out_path = os.path.join(TTS_OUTPUT_FOLDER, target_name)
 
-        resp = groq_client.audio.speech.create(
-            model="playai-tts",
-            voice=voice,
-            response_format=fmt,
-            input=text,
-        )
-        # Stream to file
-        with open(out_path, 'wb') as f:
-            for chunk in resp.iter_bytes():
-                f.write(chunk)
+        def _do_qa_tts(client, m, v, f, txt):
+            return client.audio.speech.create(
+                model=m,
+                voice=v,
+                response_format=f,
+                input=txt,
+            )
 
-        public_url = f"/static/collections/{target_name}"
-        print(f"[QA-TTS] Generated TTS via Play.ai -> {public_url}")
-        return jsonify({"audioUrl": public_url})
+        try:
+            resp = execute_with_retry(_do_qa_tts, "playai-tts", voice, fmt, text)
+        except Exception as e:
+            print(f"[QA-TTS] Error generating audio: {e}")
+            return jsonify({"error": "QA TTS generation failed"}), 500
+
+        # Collect audio bytes
+        audio_bytes = b""
+        try:
+            if hasattr(resp, 'iter_bytes'):
+                for chunk in resp.iter_bytes():
+                    audio_bytes += chunk
+            elif hasattr(resp, 'content'):
+                audio_bytes = resp.content or b''
+        except Exception as e:
+            print(f"[QA-TTS] Error collecting audio bytes: {e}")
+
+        # Store QA TTS in GridFS and associate with file document
+        if not audio_bytes:
+            return jsonify({"error": "QA TTS returned no audio bytes."}), 502
+        if fs is None:
+            return jsonify({"error": "MongoDB GridFS is not available."}), 500
+
+        qa_meta = {
+            "created_at": datetime.utcnow(),
+            "voice": voice,
+            "model": "playai-tts",
+            "format": fmt,
+            "text": text,
+        }
+        try:
+            gridfs_id = fs.put(audio_bytes, filename=target_name, contentType=f"audio/{fmt}", metadata=qa_meta)
+        except Exception as e:
+            return jsonify({"error": "Failed to store QA TTS in GridFS", "details": str(e)}), 500
+
+        # Associate with file document (if available) and save local copy under per-PDF folder
+        file_name_req = (data or {}).get('fileName') or (data or {}).get('file_name')
+        try:
+            file_doc = None
+            if file_name_req:
+                file_doc = files_collection.find_one({"originalName": file_name_req})
+            if not file_doc:
+                file_doc = files_collection.find_one({}, sort=[("uploadDate", -1)])
+
+            # per-pdf folder
+            folder_basename = None
+            if file_doc and file_doc.get('originalName'):
+                folder_basename = os.path.splitext(file_doc['originalName'])[0]
+            else:
+                folder_basename = file_name_req or f"unnamed-qa-{int(datetime.utcnow().timestamp())}"
+            safe_folder = secure_filename(folder_basename)
+            local_folder = os.path.join(TTS_OUTPUT_FOLDER, safe_folder)
+            os.makedirs(local_folder, exist_ok=True)
+
+            # save audio locally
+            local_audio_path = os.path.join(local_folder, target_name)
+            try:
+                with open(local_audio_path, 'wb') as af:
+                    af.write(audio_bytes)
+            except Exception as e:
+                print(f"[QA-TTS] Warning: failed to write QA audio locally: {e}")
+
+            audio_meta = {
+                "type": "qa",
+                "gridfs_id": gridfs_id,
+                "filename": target_name,
+                "contentType": f"audio/{fmt}",
+                "created_at": datetime.utcnow(),
+                "local_path": os.path.join(safe_folder, target_name)
+            }
+            if file_doc:
+                files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
+                files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"audios": audio_meta}})
+            else:
+                files_collection.insert_one({
+                    "originalName": file_name_req or f"unnamed-qa-{int(datetime.utcnow().timestamp())}",
+                    "uploadDate": datetime.utcnow(),
+                    "folder": safe_folder,
+                    "audios": [audio_meta]
+                })
+        except Exception as e:
+            print(f"[QA-TTS] Warning: failed to associate QA audio with files collection: {e}")
+
+        print(f"[QA-TTS] Stored QA TTS to GridFS with id: {gridfs_id}")
+        return jsonify({"audioId": str(gridfs_id)})
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -610,6 +965,135 @@ def qa_voice():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+# ==================================================================================================================================
+# --- Lipsync video orchestration ---
+
+@app.route('/api/lipsync/generate', methods=['POST'])
+def generate_lipsync_video_endpoint():
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+    data = request.get_json(silent=True) or {}
+    file_name_req = data.get('fileName') or data.get('file_name')
+    file_doc, safe_folder = resolve_file_context(file_name_req)
+
+    try:
+        result = generate_lipsync_video(target_folder=safe_folder)
+    except Exception as exc:
+        print(f"[LIPSYNC] Generation failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    video_meta = {
+        "filename": result.get("video_filename"),
+        "relative_path": result.get("relative_path"),
+        "created_at": datetime.utcnow(),
+        "source_audio_key": (result.get("audio") or {}).get("key"),
+        "source_audio_url": (result.get("audio") or {}).get("url"),
+        "tavus_video_id": (result.get("tavus") or {}).get("video_id"),
+    }
+
+    if file_doc:
+        files_collection.update_one({"_id": file_doc["_id"]}, {"$set": {"folder": safe_folder}})
+        files_collection.update_one({"_id": file_doc["_id"]}, {"$push": {"videos": video_meta}})
+    else:
+        files_collection.insert_one({
+            "originalName": file_name_req or f"unnamed-video-{int(datetime.utcnow().timestamp())}",
+            "uploadDate": datetime.utcnow(),
+            "folder": safe_folder,
+            "videos": [video_meta]
+        })
+
+    payload = {
+        "video_url": build_collection_url(video_meta["relative_path"]),
+        "folder": safe_folder,
+        "video_filename": video_meta["filename"],
+        "audio_key": video_meta["source_audio_key"],
+        "audio_url": video_meta["source_audio_url"],
+        "created_at": serialize_datetime(video_meta["created_at"]),
+    }
+    return jsonify(payload)
+
+
+@app.route('/api/lipsync/latest', methods=['GET'])
+def latest_lipsync_video_endpoint():
+    if not client:
+        return jsonify({"error": "Database connection is not available."}), 500
+    file_name_req = request.args.get('fileName') or request.args.get('file_name')
+    file_doc, safe_folder = resolve_file_context(file_name_req)
+    if not file_doc:
+        return jsonify({"video_url": None, "message": "No processed documents available."}), 404
+
+    videos = file_doc.get("videos") or []
+    latest_video = None
+    if videos:
+        latest_video = max(videos, key=lambda v: v.get("created_at") or datetime.min)
+
+    video_rel_path = None
+    timestamp = None
+    if latest_video and latest_video.get("relative_path"):
+        video_rel_path = latest_video["relative_path"]
+        timestamp = latest_video.get("created_at")
+    else:
+        video_folder = Path(TTS_OUTPUT_FOLDER) / safe_folder / "videos"
+        latest_file = None
+        if video_folder.exists():
+            candidates = list(video_folder.glob("*.mp4"))
+            if candidates:
+                latest_file = max(candidates, key=lambda f: f.stat().st_mtime)
+        if latest_file:
+            video_rel_path = latest_file.relative_to(TTS_OUTPUT_FOLDER).as_posix()
+            timestamp = datetime.utcfromtimestamp(latest_file.stat().st_mtime)
+
+    if not video_rel_path:
+        return jsonify({"video_url": None, "message": "No lipsync videos available."}), 404
+
+    # Determine the best video URL (S3 or local)
+    final_video_url = None
+    if latest_video and latest_video.get("video_url"):
+        final_video_url = latest_video["video_url"]
+    elif latest_video and latest_video.get("s3_video") and latest_video["s3_video"].get("url"):
+        final_video_url = latest_video["s3_video"]["url"]
+    else:
+        final_video_url = build_collection_url(video_rel_path)
+
+    payload = {
+        "video_url": final_video_url,
+        "folder": safe_folder,
+        "video_filename": latest_video.get("filename") if latest_video else Path(video_rel_path).name,
+        "updated_at": serialize_datetime(timestamp),
+        "audio_key": latest_video.get("source_audio_key") if latest_video else None,
+        "audio_url": latest_video.get("source_audio_url") if latest_video else None,
+    }
+    return jsonify(payload)
+
+
+@app.route('/api/upload-audio-s3', methods=['POST'])
+def upload_audio_s3_endpoint():
+    """Helper endpoint to upload a local WAV file directly to S3."""
+    if 'audio' not in request.files:
+        return jsonify({"error": "No audio file provided"}), 400
+    
+    file = request.files['audio']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+        
+    try:
+        audio_bytes = file.read()
+        filename = secure_filename(file.filename)
+        # Use a 'manual-uploads' folder to keep it separate
+        folder = "manual-uploads"
+        
+        # Re-use the existing helper from lipsync.py
+        result = upload_audio_to_s3(audio_bytes, filename, folder=folder)
+        
+        return jsonify({
+            "message": "Audio uploaded successfully",
+            "s3_key": result["key"],
+            "s3_url": result["url"]
+        })
+    except Exception as e:
+        print(f"[UPLOAD-S3] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # ===================================================================================================================================
 # --- ASSESSMENT ---
 
@@ -698,6 +1182,12 @@ def submit_answer():
 
 
 # ---------------- HTML Routing ----------------
+
+@app.route('/collections/<path:filename>')
+def serve_collections(filename):
+    """Serve generated TTS and lipsync assets under /collections."""
+    collections_root = os.path.abspath(TTS_OUTPUT_FOLDER)
+    return send_from_directory(collections_root, filename)
 
 # Serve React frontend
 @app.route('/', defaults={'path': ''})

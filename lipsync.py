@@ -1,0 +1,384 @@
+"""
+Utility helpers for connecting the Tavus lipsync API with NeuroLearn.
+
+Features:
+1. Upload learning TTS audio files to AWS S3 and derive their public URLs.
+2. Look up the latest audio file in an S3 prefix (per student/document folder).
+3. Use Tavus to generate a lipsync video for the most recent audio and store it
+   under `collections/<folder>/videos` so the frontend can stream it.
+
+This module can be used as a standalone script (`python lipsync.py`) or
+imported inside the Flask backend (`test_groq.py`) to expose API endpoints.
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Optional
+
+import requests
+from dotenv import load_dotenv
+
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover - handled at runtime
+    boto3 = None  # type: ignore
+    BotoCoreError = ClientError = Exception  # type: ignore
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Tavus configuration
+# ---------------------------------------------------------------------------
+TAVUS_API_KEYS_STR = os.getenv("TAVUS_API_KEY", "")
+TAVUS_API_KEYS = [k.strip() for k in TAVUS_API_KEYS_STR.split(',') if k.strip()]
+REPLICA_ID = os.getenv("REPLICA_ID")
+
+_current_tavus_key_index = 0
+
+def get_current_tavus_key():
+    global _current_tavus_key_index
+    if not TAVUS_API_KEYS:
+        return None
+    return TAVUS_API_KEYS[_current_tavus_key_index]
+
+def rotate_tavus_key():
+    global _current_tavus_key_index
+    if not TAVUS_API_KEYS:
+        return
+    _current_tavus_key_index = (_current_tavus_key_index + 1) % len(TAVUS_API_KEYS)
+    print(f"Rotating to Tavus API key index: {_current_tavus_key_index}")
+
+def execute_tavus_with_retry(func, *args, **kwargs):
+    """
+    Execute a function that uses the Tavus API key.
+    If it fails with a 4xx/5xx error (likely auth or rate limit), rotate the key and retry.
+    """
+    if not TAVUS_API_KEYS:
+         # Fallback if no keys configured, though _require_tavus_credentials checks this
+         return func(None, *args, **kwargs)
+
+    max_retries = len(TAVUS_API_KEYS)
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            api_key = get_current_tavus_key()
+            return func(api_key, *args, **kwargs)
+        except Exception as e:
+            # Do not retry on timeouts (polling exceeded) or missing resources (404)
+            if isinstance(e, (TimeoutError, FileNotFoundError)):
+                raise e
+            
+            print(f"Tavus attempt {attempt + 1} failed with key index {_current_tavus_key_index}: {e}")
+            last_exception = e
+            rotate_tavus_key()
+    
+    raise last_exception
+
+TAVUS_BASE = "https://tavusapi.com"
+VIDEOS_CREATE = f"{TAVUS_BASE}/v2/videos"
+VIDEOS_GET = lambda vid: f"{TAVUS_BASE}/v2/videos/{vid}"
+DEFAULT_AUDIO_URL = os.getenv("AUDIO_PUBLIC_URL")
+DEFAULT_VIDEO_NAME = os.getenv("DEFAULT_LIPSYNC_VIDEO_NAME", "tavus_video.mp4")
+
+# ---------------------------------------------------------------------------
+# AWS / storage configuration
+# ---------------------------------------------------------------------------
+COLLECTIONS_ROOT = Path(os.getenv("COLLECTIONS_ROOT", "collections")).resolve()
+COLLECTIONS_ROOT.mkdir(parents=True, exist_ok=True)
+
+AWS_AUDIO_BUCKET = os.getenv("AWS_AUDIO_BUCKET") or os.getenv("AWS_S3_BUCKET")
+AWS_AUDIO_PREFIX = os.getenv("AWS_AUDIO_PREFIX", "learning-tts")
+AWS_VIDEO_PREFIX = os.getenv("AWS_VIDEO_PREFIX", "learning-videos")
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+AWS_AUDIO_PUBLIC_BASE_URL = os.getenv("AWS_AUDIO_PUBLIC_BASE_URL")
+AWS_AUDIO_UPLOAD_ACL = os.getenv("AWS_AUDIO_UPLOAD_ACL", "public-read")
+
+_s3_client = None
+
+
+# ---------------------------------------------------------------------------
+# AWS helpers
+# ---------------------------------------------------------------------------
+def get_s3_client():
+    """Return a cached boto3 client or raise if configuration is missing."""
+    global _s3_client
+    if _s3_client is None:
+        if boto3 is None:
+            raise RuntimeError("boto3 is required for AWS interactions. Install boto3 to continue.")
+        if not AWS_AUDIO_BUCKET:
+            raise RuntimeError("AWS_AUDIO_BUCKET (or AWS_S3_BUCKET) is not configured.")
+        _s3_client = boto3.client("s3", region_name=AWS_REGION)
+    return _s3_client
+
+
+def build_audio_prefix(folder: Optional[str] = None) -> str:
+    segments = [AWS_AUDIO_PREFIX.strip("/")] if AWS_AUDIO_PREFIX else []
+    if folder:
+        segments.append(folder.strip("/"))
+    return "/".join(filter(None, segments))
+
+
+def build_audio_key(filename: str, folder: Optional[str] = None) -> str:
+    prefix = build_audio_prefix(folder)
+    return "/".join(filter(None, [prefix, filename]))
+
+
+def build_audio_public_url(key: str) -> str:
+    if not AWS_AUDIO_BUCKET:
+        raise RuntimeError("AWS_AUDIO_BUCKET is not set; cannot build public URL.")
+    if AWS_AUDIO_PUBLIC_BASE_URL:
+        base = AWS_AUDIO_PUBLIC_BASE_URL.rstrip("/")
+        return f"{base}/{key.lstrip('/')}"
+    region = AWS_REGION or "us-east-1"
+    if region == "us-east-1":
+        return f"https://{AWS_AUDIO_BUCKET}.s3.amazonaws.com/{key}"
+    return f"https://{AWS_AUDIO_BUCKET}.s3.{region}.amazonaws.com/{key}"
+
+
+def upload_audio_to_s3(
+    audio_bytes: bytes,
+    filename: str,
+    folder: Optional[str] = None,
+    content_type: str = "audio/wav",
+) -> Dict[str, str]:
+    """Upload audio bytes to S3 and return the object metadata."""
+    client = get_s3_client()
+    key = build_audio_key(filename, folder)
+    put_kwargs = {
+        "Bucket": AWS_AUDIO_BUCKET,
+        "Key": key,
+        "Body": audio_bytes,
+        "ContentType": content_type,
+    }
+    if AWS_AUDIO_UPLOAD_ACL:
+        put_kwargs["ACL"] = AWS_AUDIO_UPLOAD_ACL
+    try:
+        client.put_object(**put_kwargs)
+    except (BotoCoreError, ClientError) as exc:  # pragma: no cover - network call
+        raise RuntimeError(f"Failed to upload audio to S3: {exc}") from exc
+
+    return {"key": key, "url": build_audio_public_url(key)}
+
+
+def build_video_key(filename: str, folder: Optional[str] = None) -> str:
+    segments = [AWS_VIDEO_PREFIX.strip("/")] if AWS_VIDEO_PREFIX else []
+    if folder:
+        segments.append(folder.strip("/"))
+    return "/".join(filter(None, segments + [filename]))
+
+
+def upload_video_to_s3(
+    video_path: Path,
+    folder: Optional[str] = None,
+    content_type: str = "video/mp4",
+) -> Dict[str, str]:
+    """Upload video file to S3 and return the object metadata."""
+    client = get_s3_client()
+    filename = video_path.name
+    key = build_video_key(filename, folder)
+    
+    # Read file content
+    with open(video_path, "rb") as f:
+        video_bytes = f.read()
+
+    put_kwargs = {
+        "Bucket": AWS_AUDIO_BUCKET,  # Reusing the same bucket
+        "Key": key,
+        "Body": video_bytes,
+        "ContentType": content_type,
+    }
+    if AWS_AUDIO_UPLOAD_ACL:
+        put_kwargs["ACL"] = AWS_AUDIO_UPLOAD_ACL
+    try:
+        client.put_object(**put_kwargs)
+    except (BotoCoreError, ClientError) as exc:
+        raise RuntimeError(f"Failed to upload video to S3: {exc}") from exc
+    
+    # Reuse build_audio_public_url logic as it just constructs URL based on key and bucket
+    return {"key": key, "url": build_audio_public_url(key)}
+
+def get_latest_audio_from_s3(folder: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Return the latest (newest LastModified) audio object for a folder."""
+    client = get_s3_client()
+    params = {"Bucket": AWS_AUDIO_BUCKET}
+    prefix = build_audio_prefix(folder)
+    if prefix:
+        params["Prefix"] = prefix if prefix.endswith("/") else f"{prefix}/"
+    paginator = client.get_paginator("list_objects_v2")
+    latest_obj = None
+    for page in paginator.paginate(**params):
+        for obj in page.get("Contents", []):
+            if obj.get("Size", 0) == 0:  # Skip empty folder markers
+                continue
+            if latest_obj is None or obj["LastModified"] > latest_obj["LastModified"]:
+                latest_obj = obj
+    if not latest_obj:
+        return None
+    key = latest_obj["Key"]
+    return {
+        "key": key,
+        "url": build_audio_public_url(key),
+        "last_modified": latest_obj["LastModified"].isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tavus helpers
+# ---------------------------------------------------------------------------
+def _require_tavus_credentials():
+    if not TAVUS_API_KEYS or not REPLICA_ID:
+        raise RuntimeError("TAVUS_API_KEY (comma-separated) and REPLICA_ID must be set in the environment.")
+
+
+def create_tavus_video(audio_url: str, video_name: str = "cloud-pipe-video", callback_url: Optional[str] = None):
+    _require_tavus_credentials()
+
+    def _do_create(api_key, a_url, v_name, cb_url):
+        headers = {"Content-Type": "application/json", "x-api-key": api_key}
+        body = {"replica_id": REPLICA_ID, "audio_url": a_url, "video_name": v_name}
+        if cb_url:
+            body["callback_url"] = cb_url
+
+        resp = requests.post(VIDEOS_CREATE, headers=headers, json=body, timeout=30)
+        try:
+            resp.raise_for_status()
+        except Exception:
+            print("Tavus create failed:", resp.status_code, resp.text)
+            raise
+        return resp.json()
+
+    return execute_tavus_with_retry(_do_create, audio_url, video_name, callback_url)
+
+
+def poll_video(video_id: str, interval: int = 5, timeout: int = 600):
+    _require_tavus_credentials()
+    
+    def _do_poll(api_key, vid, intr, to):
+        headers = {"x-api-key": api_key}
+        t0 = time.time()
+        while True:
+            r = requests.get(VIDEOS_GET(vid), headers=headers, timeout=20)
+            if r.status_code != 200:
+                print("Poll error:", r.status_code, r.text)
+                if r.status_code == 404:
+                    raise FileNotFoundError(f"Video {vid} not found (404).")
+                # If 401/403, we might want to rotate. 
+                # Raising exception here triggers rotation in execute_tavus_with_retry
+                if r.status_code in (401, 403, 429): 
+                    r.raise_for_status()
+            
+            data = r.json()
+            status = data.get("status")
+            print(f"[poll] status={status}")
+            if status == "ready":
+                return data
+            if status == "error":
+                raise RuntimeError("Tavus returned error: " + json.dumps(data))
+            if time.time() - t0 > to:
+                raise TimeoutError("Timed out waiting for Tavus video")
+            time.sleep(intr)
+
+    # Note: polling is a long running process. If we rotate key mid-poll, we restart polling.
+    # This is acceptable as long as the video ID is valid for all keys (which it should be if keys are for same account/replica)
+    # If keys are for DIFFERENT accounts, then video_id from key A won't work with key B.
+    # Assumption: User provides keys for the SAME account or keys that can access the same replica/videos.
+    # If keys are independent accounts, rotation during polling won't work for the *same* video ID.
+    # However, create_tavus_video rotation handles the initial creation.
+    # For polling, we'll assume the key that created it works, or if it fails (e.g. rate limit), another key *might* work 
+    # if they share access. If they don't share access, polling rotation is futile but harmless (will just fail again).
+    return execute_tavus_with_retry(_do_poll, video_id, interval, timeout)
+
+
+def download_url(url: str, out_path: Path):
+    print("Downloading:", url)
+    r = requests.get(url, stream=True, timeout=60)
+    r.raise_for_status()
+    with open(out_path, "wb") as f:
+        for chunk in r.iter_content(8192):
+            if chunk:
+                f.write(chunk)
+    print("Saved to:", out_path.resolve())
+
+
+def generate_lipsync_video(
+    target_folder: str,
+    audio_url: Optional[str] = None,
+    video_filename: Optional[str] = None,
+) -> Dict[str, object]:
+    """Generate a Tavus video for the latest audio in S3 and save it locally."""
+    folder_name = target_folder.strip() or "default"
+    videos_dir = COLLECTIONS_ROOT.joinpath(folder_name, "videos")
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    audio_info = None
+    if audio_url:
+        audio_info = {"url": audio_url, "key": None}
+    else:
+        audio_info = get_latest_audio_from_s3(folder_name)
+        if not audio_info:
+            raise RuntimeError(
+                f"No learning TTS audio files were found in S3 for folder '{folder_name}'. "
+                "Ensure /api/learning-tts has uploaded audio to S3 before invoking lipsync."
+            )
+        audio_url = audio_info["url"]
+
+    filename = video_filename or f"learning-video-{int(time.time())}.mp4"
+    create_resp = create_tavus_video(audio_url, video_name=Path(filename).stem)
+    video_id = create_resp.get("video_id") or create_resp.get("id")
+    if not video_id:
+        raise RuntimeError(f"No video_id returned by Tavus: {create_resp}")
+
+    video_data = poll_video(video_id, interval=5, timeout=600)
+    download_url_field = (
+        video_data.get("download_url")
+        or video_data.get("hosted_url")
+        or video_data.get("result", {}).get("download_url")
+    )
+    if not download_url_field:
+        raise RuntimeError("Tavus response did not include a downloadable URL.")
+
+    out_path = videos_dir / filename
+    download_url(download_url_field, out_path)
+
+    # Upload to S3
+    s3_video_info = None
+    try:
+        s3_video_info = upload_video_to_s3(out_path, folder=folder_name)
+        print(f"✅ Video uploaded to S3: {s3_video_info['url']}")
+    except Exception as e:
+        print(f"⚠️ Failed to upload video to S3: {e}")
+
+    relative_path = out_path.relative_to(COLLECTIONS_ROOT).as_posix()
+    return {
+        "video_path": str(out_path),
+        "relative_path": relative_path,
+        "video_filename": filename,
+        "audio": audio_info,
+        "tavus": {"video_id": video_id, "raw": video_data},
+        "s3_video": s3_video_info,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI runner (optional)
+# ---------------------------------------------------------------------------
+def main():
+    target_folder = os.getenv("DEFAULT_COLLECTION_FOLDER", "demo")
+    audio_url = DEFAULT_AUDIO_URL
+    if not audio_url:
+        print("No AUDIO_PUBLIC_URL provided. Falling back to the latest S3 audio object.")
+    try:
+        result = generate_lipsync_video(target_folder=target_folder, audio_url=audio_url)
+        print("✅ Lipsync video generated:", result["video_path"])
+    except Exception as exc:
+        print(f"❌ Unable to generate lipsync video: {exc}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

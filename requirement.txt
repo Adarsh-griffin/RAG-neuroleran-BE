@@ -16,3 +16,6 @@ pypdf
 PyPDF2
 sentence-transformers
 huggingface_hub
+
+python-dotenv
+boto3

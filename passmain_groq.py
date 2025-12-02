@@ -43,20 +43,62 @@ def save_explanation_to_mongo(file_path, explanation):
 # Groq Setup
 # =====================================================================================================
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Groq Setup with Rotation
+GROQ_API_KEYS_STR = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEYS = [k.strip() for k in GROQ_API_KEYS_STR.split(',') if k.strip()]
+
+if not GROQ_API_KEYS:
+    # Fallback to single key if comma split fails or not present (backward compat)
+    single_key = os.getenv("GROQ_API_KEY")
+    if single_key:
+        GROQ_API_KEYS = [single_key]
+    else:
+        raise ValueError("GROQ_API_KEY environment variable is required.")
+
+_current_key_index = 0
+
+def get_current_groq_client():
+    global _current_key_index
+    return Groq(api_key=GROQ_API_KEYS[_current_key_index])
+
+def rotate_key():
+    global _current_key_index
+    _current_key_index = (_current_key_index + 1) % len(GROQ_API_KEYS)
+    print(f"Rotating to Groq API key index: {_current_key_index}")
+
+def execute_with_retry(func, *args, **kwargs):
+    max_retries = len(GROQ_API_KEYS)
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            client = get_current_groq_client()
+            return func(client, *args, **kwargs)
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed with key index {_current_key_index}: {e}")
+            last_exception = e
+            rotate_key()
+    raise last_exception
 
 def groq_generate(prompt, max_tokens=700, temperature=0.7):
     """Send prompt to Groq API and return response text."""
-    completion = groq_client.chat.completions.create(
-        model="openai/gpt-oss-20b",   # You can change this to other Groq models
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_completion_tokens=max_tokens,
-        top_p=1,
-        reasoning_effort="low",
-        stream=False
-    )
-    return completion.choices[0].message.content.strip()
+    
+    def _do_generate(client, p, mt, temp):
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": p}],
+            temperature=temp,
+            max_completion_tokens=mt,
+            top_p=1,
+            reasoning_effort="low",
+            stream=False
+        )
+        return completion.choices[0].message.content.strip()
+
+    try:
+        return execute_with_retry(_do_generate, prompt, max_tokens, temperature)
+    except Exception as e:
+        print(f"Error generating response after retries: {e}")
+        return None
 
 
 # =====================================================================================================
