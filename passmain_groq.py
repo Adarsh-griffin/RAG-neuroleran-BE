@@ -236,5 +236,18 @@ if file_doc:
 
     print("\n📦 Final Structured Output:\n", output)
 
+    # --- IMAGE FINDER INTEGRATION ---
+    from image_finder import process_images_for_file
+    
+    # Extract text from the output for keyword generation
+    # Output is a list of dicts, we combine explanations
+    combined_summary = " ".join([item.get("explanation", "") for item in output])
+    
+    if combined_summary:
+        print(f"\n🚀 Triggering Image Finder for {pdf_path}...")
+        process_images_for_file(file_doc["filePath"], combined_summary)
+    else:
+        print("⚠️ No summary text available for image finding.")
+
 else:
     print("⚠️ No file found in MongoDB")

@@ -309,6 +309,63 @@ def get_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# @app.route('/api/qa', methods=['POST'])
+# def ask_question():
+#     """
+#     This endpoint handles AI queries for both qa.html and learning.html
+#     """
+#     data = request.json
+#     query = data.get('question', '')
+
+#     # --- START OF ADDED CODE ---
+#     file_name = data.get('fileName', '')
+
+#     if not query:
+#         return jsonify({'error': 'No question provided'}), 400
+#     if not file_name:
+#         return jsonify({'error': 'No file name provided for context'}), 400
+        
+#     collection_name = os.path.splitext(os.path.basename(file_name))[0].lower().replace(" ", "_")
+#     # --- END OF ADDED CODE ---
+
+#     try:
+#         retriever = get_relevant_docs(query, collection_name)
+
+#         qa = RetrievalQA.from_chain_type(
+#             llm=GroqLLM(),   # ✅ fixed: pass wrapped Groq LLM
+#             chain_type="stuff",
+#             retriever=retriever,
+#             return_source_documents=False
+#         )
+
+#         template = '''You are an AI tutor designed to assist students by providing
+#         clear, concise, and easy-to-understand answers to their queries.
+
+#         Your task:
+#         1. Retrieve relevant information from the knowledge base.
+#         2. Provide an informative yet simple response.
+#         3. Use examples and analogies when necessary.
+#         4. Avoid unnecessary details and technical jargon.
+
+#         Now answer the following question:
+#         {query}'''
+
+#         prompt = PromptTemplate(template=template, input_variables=["query"])
+#         formatted_prompt = prompt.format(query=query)
+
+#         response = qa.invoke({"query": formatted_prompt})  # ✅ pass dict with query
+#         result_text = response['result'].strip()
+#         helpful_answer = extract_helpful_answer(result_text)
+#         wrapped_response = textwrap.fill(helpful_answer, width=80)
+
+#         return jsonify({'response': wrapped_response})
+        
+
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()  # ✅ log full error in Flask console
+#         return jsonify({'error': str(e)}), 500
+    
 @app.route('/api/qa', methods=['POST'])
 def ask_question():
     """
@@ -316,8 +373,6 @@ def ask_question():
     """
     data = request.json
     query = data.get('question', '')
-
-    # --- START OF ADDED CODE ---
     file_name = data.get('fileName', '')
 
     if not query:
@@ -326,46 +381,60 @@ def ask_question():
         return jsonify({'error': 'No file name provided for context'}), 400
         
     collection_name = os.path.splitext(os.path.basename(file_name))[0].lower().replace(" ", "_")
-    # --- END OF ADDED CODE ---
 
     try:
         retriever = get_relevant_docs(query, collection_name)
 
-        qa = RetrievalQA.from_chain_type(
-            llm=GroqLLM(),   # ✅ fixed: pass wrapped Groq LLM
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False
-        )
-
-        template = '''You are an AI tutor designed to assist students by providing
-        clear, concise, and easy-to-understand answers to their queries.
-
-        Your task:
-        1. Retrieve relevant information from the knowledge base.
-        2. Provide an informative yet simple response.
-        3. Use examples and analogies when necessary.
-        4. Avoid unnecessary details and technical jargon.
-
-        Now answer the following question:
-        {query}'''
-
-        prompt = PromptTemplate(template=template, input_variables=["query"])
-        formatted_prompt = prompt.format(query=query)
-
-        response = qa.invoke({"query": formatted_prompt})  # ✅ pass dict with query
-        result_text = response['result'].strip()
-        helpful_answer = extract_helpful_answer(result_text)
-        wrapped_response = textwrap.fill(helpful_answer, width=80)
-
-        return jsonify({'response': wrapped_response})
+        # 1. NEW HUMAN-LIKE TEMPLATE
+        # We use {context} and {question} placeholders for the RetrievalQA chain
+        template = """
+        Use the context to explain the topic for a student using a clear, bulleted list. 
+        Follow these style rules:
+        Rules for Pointers:
+        1. Every bullet point MUST start with a dash and a single space (Example: "- Item").
+        2. Do not use any indentation before the dash.
+        3. Ensure there is an empty line before starting a list.
+        - Use a short introductory sentence.
+        - Use bullet points for key features or steps.
+        - Use bold text **only** for the names of parts or specific terms.
+        - Keep the language simple and easy to memorize.
+        - Do not use a summary or conclusion at the end.
         
 
+        Context: {context}
+        Question: {question}
+        Answer:"""
+
+        prompt = PromptTemplate(
+            template=template, 
+            input_variables=["context", "question"]
+        )
+
+        # 2. UPDATED CHAIN CONFIGURATION
+        qa = RetrievalQA.from_chain_type(
+            llm=GroqLLM(),
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=False,
+            # This is key: it injects our clean prompt into the RAG process
+            chain_type_kwargs={"prompt": prompt} 
+        )
+
+        # 3. INVOKE AND CLEAN RESPONSE
+        # Note: We pass the raw query here; the chain handles the prompt formatting
+        response = qa.invoke({"query": query}) 
+        
+        # We remove 'textwrap.fill' and 'extract_helpful_answer' to keep the 
+        # text natural and avoid the 'fixed-width' terminal look.
+        final_answer = response['result'].strip()
+
+        return jsonify({'response': final_answer})
+        
     except Exception as e:
         import traceback
-        traceback.print_exc()  # ✅ log full error in Flask console
-        return jsonify({'error': str(e)}), 500
-    
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500   
+
 
 #=================================================================================================================================
 # ---------------- Learning ----------------
@@ -398,7 +467,15 @@ def get_text():
         texts.append(str(exp).strip())
 
     combined_text = " ".join([t for t in texts if t])
-    return jsonify({"script_text": combined_text or "No content available."})
+    
+    # Extract images (default to empty list)
+    images = file_doc.get("images", [])
+    
+    return jsonify({
+        "script_text": combined_text or "No content available.",
+        "images": images,
+        "fileName": file_doc.get("originalName") # e.g. jesc110.pdf
+    })
    
 
 @app.route("/api/get_links")
@@ -912,26 +989,43 @@ def qa_voice():
         # Route through existing QA pipeline with retrieval context
         collection_name = os.path.splitext(os.path.basename(file_name_ctx))[0].lower().replace(" ", "_")
         retriever = get_relevant_docs(effective_query, collection_name)
+        # qa = RetrievalQA.from_chain_type(
+        #     llm=GroqLLM(),
+        #     chain_type="stuff",
+        #     retriever=retriever,
+        #     return_source_documents=False
+        # )
+        template = """
+        Use the following pieces of context to explain the topic to a student using clear pointers.
+        Rules for Pointers:
+        1. Every bullet point MUST start with a dash and a single space (Example: "- Item").
+        2. Do not use any indentation before the dash.
+        3. Ensure there is an empty line before starting a list.
+        
+        Guidelines:
+        - Start with a single, helpful introductory sentence.
+        - Use a dashed list (- ) for the main points.
+        - Use bold text **only** for technical terms or names of parts.
+        - Do not use headers like 'Summary', 'Key points', or 'Analogy'.
+        - Do not repeat the user's question.
+        - Keep the tone professional but very easy to understand.
+
+        Context: {context}
+        Question: {question}
+        Answer:"""
+        prompt_obj = PromptTemplate(
+            template=template, 
+            input_variables=["context", "question"]
+        )
         qa = RetrievalQA.from_chain_type(
             llm=GroqLLM(),
             chain_type="stuff",
             retriever=retriever,
-            return_source_documents=False
+            return_source_documents=False,
+            chain_type_kwargs={"prompt": prompt_obj}
         )
-        template = '''You are an AI tutor designed to assist students by providing
-        clear, concise, and easy-to-understand answers to their queries.
-
-        Your task:
-        1. Retrieve relevant information from the knowledge base.
-        2. Provide an informative yet simple response.
-        3. Use examples and analogies when necessary.
-        4. Avoid unnecessary details and technical jargon.
-
-        Now answer the following question:
-        {query}'''
-        prompt = PromptTemplate(template=template, input_variables=["query"]).format(query=effective_query)
-        qa_resp = qa.invoke({"query": prompt})
-        answer_text = textwrap.fill(extract_helpful_answer(qa_resp['result'].strip()), width=80)
+        qa_resp = qa.invoke({"query": effective_query})
+        answer_text = qa_resp['result'].strip()
         print(f"[QA-VOICE] Answer: {answer_text}")
 
         # Optional: TTS placeholder (Kokoro not wired yet)
@@ -1109,13 +1203,37 @@ def generate_question():
         explanations = [item.get("explanation", "") for item in file_doc["explanation"]]
         combined_explanation = " ".join(explanations)
 
-        template = f"""
-        You are a tutor. Based on the following explanation, create ONE clear question
-        that checks whether the student has understood the concept.
+        # Get question type from query params
+        q_type = request.args.get('type', 'theoretical')
+        print(f"[ASSESSMENT] Generating {q_type} question")
 
-        Explanation: {combined_explanation}
-        Question:
-        """
+        template = ""
+        if q_type == 'mcq':
+            template = f"""
+            You are a tutor. Based on the following explanation, create ONE multiple-choice question (MCQ)
+            that checks whether the student has understood the concept.
+            
+            STRICT Format:
+            Question: [The question text]
+            A) [Option A text]
+            B) [Option B text]
+            C) [Option C text]
+            D) [Option D text]
+            Correct Answer: [Option X]
+            Explanation: [Explanation why it is correct]
+            Hint: [A helpful hint without giving away the answer]
+            
+            Explanation: {combined_explanation}
+            Question:
+            """
+        else:
+            template = f"""
+            You are a tutor. Based on the following explanation, create ONE clear question
+            that checks whether the student has understood the concept.
+
+            Explanation: {combined_explanation}
+            Question:
+            """
         response = llm(template)
 
         start_index = response.find("Question:")
@@ -1149,20 +1267,26 @@ def submit_answer():
         if not question or not student_answer:
             return jsonify({"error": "Both question and answer are required"}), 400
 
-        prompt = f""" You are a tutor.
+        prompt = f"""You are an AI tutor providing feedback on a student's answer.
+        Use the following context to evaluate their response.
 
-        Explanation: {combined_explanation}
+        Structure your feedback using these pointers:
+        - **Status**: Start with 'Correct', 'Partially Correct', or 'Incorrect'.
+        - **What you got right**: Use a dash list to highlight correct points.
+        - **What to improve**: Use a dash list to explain missing or wrong information.
+        - **Key Concept**: A one-sentence summary of the core fact.
+
+        Style Rules:
+        - Use a dash followed by a space (- ) for every bullet point.
+        - Do not add extra spaces before the dashes.
+        - Ensure there is an empty line before starting a list.
+        - Use bold text **only** for key terms.
+        - Keep it encouraging and simple.
+
+        Context: {combined_explanation}
         Question: {question}
-        Student's Answer: {student_answer}
-
-        Tasks:
-        1. Check if the student’s answer is correct or not (be fair).
-        2. Point out mistakes or missing parts if any.
-        3. Give encouraging, constructive feedback.
-        4. If wrong, provide the correct answer.
-
-        Feedback:
-        """
+        Student Answer: {student_answer}
+        Answer:"""
 
         evaluation = llm(prompt)
 
