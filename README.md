@@ -66,9 +66,10 @@ FAL_API_KEY=your_fal_ai_key
 
 ## 2. Backend Setup (`NeuroBack`)
 
-1.  **Navigate to the backend directory:**
+1.  **Clone the repository:**
     ```bash
-    cd NeuroBack
+    git clone https://github.com/Adarsh-griffin/RAG-neuroleran-BE.git
+    cd RAG-neuroleran-BE
     ```
 
 2.  **Create and activate a virtual environment (optional but recommended):**
@@ -99,9 +100,10 @@ FAL_API_KEY=your_fal_ai_key
 
 ## 3. Frontend Setup (`NeuroFront`)
 
-1.  **Navigate to the frontend directory:**
+1.  **Clone the repository:**
     ```bash
-    cd NeuroFront
+    git clone https://github.com/Adarsh-griffin/RAG-neuroleran-FE.git
+    cd RAG-neuroleran-FE
     ```
 
 2.  **Install Node.js dependencies:**
